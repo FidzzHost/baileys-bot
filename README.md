@@ -11,8 +11,12 @@ poll, location, contact, dst). Logic bisnis kamu tulis sendiri lewat hook
 
 - **Multi-runtime**: Linux/VPS, Termux Android, Windows.
 - **Auth flexible**: pairing-code (8-digit) **atau** QR — toggle via env.
-- **Stability**: auto-reconnect dengan backoff per-`DisconnectReason`, anti
-  bad-session, anti loop, keep-alive 30 s, swallow unhandled rejections.
+- **Stability**: auto-reconnect dengan backoff per-`DisconnectReason`,
+  in-memory message store untuk peer retry-receipts (anti "waiting for this
+  message"), `fetchLatestBaileysVersion()` tiap boot, group metadata cache
+  10 menit, keep-alive 25 s, terminal exit untuk `loggedOut` /
+  `connectionReplaced` / `forbidden` (anti loop), swallow unhandled
+  rejections.
 - **Comprehensive parser**: unwrap ephemeral / view-once / document-with-caption
   wrappers, extract text/quoted/mentions dari semua tipe pesan termasuk
   `buttonsResponse`, `listResponse`, `interactiveResponse`, `templateButtonReply`.
@@ -85,14 +89,18 @@ src/
 ├── config/env.ts           # loader .env + validasi
 ├── core/
 │   ├── auth.ts             # multi-file auth, normalisasi nomor, clear session
-│   ├── socket.ts           # makeWASocket + reconnect/backoff + onSocket binders
+│   ├── socket.ts           # makeWASocket + reconnect/backoff + onSocket binders + getMessage cb
+│   ├── messageStore.ts     # in-memory store untuk getMessage + cachedGroupMetadata
 │   └── logger.ts           # pino + pino-pretty
 ├── handlers/
 │   ├── messages.ts         # onMessage() registry + dispatcher (auto-rebind on reconnect)
 │   └── groups.ts           # onGroupUpdate() registry + dispatcher
 └── lib/
     ├── parser.ts           # extract text/quoted/mentions/jid (unwrap ephemeral, viewOnce, dst)
-    ├── messages.ts         # SEMUA send helpers — basic + rich
+    ├── messages.ts         # send helpers — basic (text/media/list/buttons/CTA/poll/contact/location)
+    ├── business.ts         # business send helpers — native flow, MPM, catalog, single product, carousel, address/location request
+    ├── sticker.ts          # toWebp() + sendStickerFromMedia()
+    ├── status.ts           # status / story tracking — list, mark-read, download
     ├── permissions.ts      # owner & admin checks
     └── db.ts               # better-sqlite3 + kv store + group settings
 ```
@@ -197,13 +205,326 @@ onMessage(async ({ sock, msg }) => {
 ```
 text · image · video · audio · document · sticker
 contact · contactsArray · location · liveLocation
-poll · reaction
+poll · pollUpdate · reaction
 buttonsResponse · listResponse · templateButtonReply · interactiveResponse
+product · order · invoice · paymentRequest · paymentSend · paymentInvite
 protocolEdit · protocolDelete · unknown
 ```
 
 `msg.quoted.kind` punya range yang sama, plus `msg.quoted.asWAMessage` siap
 di-pass ke `downloadMedia()`.
+
+Untuk button / list / interactive responses:
+- `msg.responseId` — id yang dipilih user (semua tipe response)
+- `msg.responseName` — nama native flow button (`quick_reply`, `cta_url`, `mpm`, `single_select`, dst.)
+- `msg.responseParams` — parsed `paramsJson` payload (untuk interactive response)
+
+```ts
+onMessage(async ({ sock, msg }) => {
+  if (msg.kind === 'interactiveResponse') {
+    console.log('User tapped:', msg.responseName, msg.responseId)
+    console.log('Full params:', msg.responseParams)
+  }
+})
+```
+
+## Sticker — `toWebp()` & `sendStickerFromMedia()`
+
+```ts
+import { toWebp, sendStickerFromMedia } from './lib/sticker'
+import { downloadMedia } from './lib/messages'
+
+// Image / video di-quote → sticker
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!s') return
+  if (!msg.quoted || !['image', 'video'].includes(msg.quoted.kind)) {
+    await reply(sock, msg.chatJid, 'Reply gambar/video dulu ya.', msg.raw)
+    return
+  }
+  const buf = await downloadMedia(sock, msg.quoted.asWAMessage)
+  await sendStickerFromMedia(sock, msg.chatJid, buf, {
+    pack: 'My Pack',
+    author: msg.senderJid.split('@')[0],
+    type: 'full',           // 'full' | 'crop' | 'circle' | 'rounded'
+    quality: 60,
+    quoted: msg.raw,
+  })
+})
+
+// Atau langsung dari URL
+const webp = await toWebp('https://example.com/image.png', { type: 'circle' })
+```
+
+Constraints WhatsApp: animated sticker ≤ 10 detik & ≤ 500 KB. Sumber video
+sebaiknya ≤ 6 detik supaya aman.
+
+## Status / Story (`status@broadcast`) — `src/lib/status.ts`
+
+Auto-tracker untuk story / status update kontak. `attachStatusTracker()`
+sudah dipanggil di `index.ts`. Bot menyimpan setiap status yang masuk ke
+in-memory store (cap 500, FIFO evict). Pas nomor bot di-HP nge-view sebuah
+status, multi-device sync notify ke bot → entry-nya ditandai sebagai
+read (`readAt` di-set).
+
+```ts
+import {
+  onStatusReceived,
+  onStatusRead,
+  getStatuses,
+  getReadStatuses,
+  getUnreadStatuses,
+  markStatusRead,
+  readAllStatuses,
+  downloadStatusMedia,
+} from './lib/status'
+import * as fs from 'fs'
+
+// (1) Hook: log setiap status yang masuk
+onStatusReceived(entry => {
+  console.log(`[status] ${entry.from} - ${entry.kind} - "${entry.text}"`)
+})
+
+// (2) Hook: auto-download media setiap kali bot baca status
+onStatusRead(async entry => {
+  if (!['image', 'video'].includes(entry.kind)) return
+  const sock = getSocket()
+  if (!sock) return
+  const buf = await downloadStatusMedia(sock, entry)
+  const ext = entry.mimeType?.split('/')[1] ?? 'bin'
+  fs.mkdirSync('./status-dump', { recursive: true })
+  fs.writeFileSync(`./status-dump/${entry.id}.${ext}`, buf)
+  console.log(`saved ${entry.id}.${ext} (${buf.length} bytes)`)
+})
+
+// (3) Command: kasih daftar status yang udah di-read
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!status:list') return
+  const list = getReadStatuses()
+  const lines = list.map(
+    e =>
+      `• ${e.from.split('@')[0]} — ${e.kind}` +
+      (e.text ? ` — ${e.text.slice(0, 30)}` : ''),
+  )
+  await reply(
+    sock,
+    msg.chatJid,
+    `Read statuses (${list.length}):\n${lines.join('\n') || '(kosong)'}`,
+    msg.raw,
+  )
+})
+
+// (4) Command: download semua status read sekaligus
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!status:save') return
+  const list = getReadStatuses().filter(e => ['image', 'video'].includes(e.kind))
+  for (const entry of list) {
+    const buf = await downloadStatusMedia(sock, entry)
+    const ext = entry.mimeType?.split('/')[1] ?? 'bin'
+    fs.mkdirSync('./status-dump', { recursive: true })
+    fs.writeFileSync(`./status-dump/${entry.id}.${ext}`, buf)
+  }
+  await reply(sock, msg.chatJid, `✅ Saved ${list.length} files`, msg.raw)
+})
+
+// (5) Mark semua unread sebagai read sekaligus + auto download
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!status:readall') return
+  const just = await readAllStatuses(sock)
+  await reply(sock, msg.chatJid, `Marked ${just.length} as read`, msg.raw)
+})
+```
+
+API ringkas:
+
+| Function | Returns | Purpose |
+| --- | --- | --- |
+| `onStatusReceived(handler)` | disposer | hook setiap status baru masuk |
+| `onStatusRead(handler)` | disposer | hook setiap status di-read (sync atau manual) |
+| `getStatuses()` | `StatusEntry[]` | semua status di memori |
+| `getReadStatuses()` | `StatusEntry[]` | filter `readAt` ter-set |
+| `getUnreadStatuses()` | `StatusEntry[]` | belum di-read |
+| `markStatusRead(sock, target)` | `Promise<entry>` | kirim read receipt + flag readAt |
+| `readAllStatuses(sock)` | `Promise<entry[]>` | bulk-read semua unread |
+| `downloadStatusMedia(sock, entry)` | `Promise<Buffer>` | download bytes media-nya |
+
+Field `StatusEntry`: `id`, `from`, `kind`, `text`, `mimeType`, `receivedAt`,
+`readAt`, `raw`.
+
+Catatan: Memori in-memory aja. Setelah bot restart, list-nya kosong lagi.
+Kalau butuh persistensi, simpan `readAt`/`id`-nya ke SQLite via `lib/db.ts`.
+
+## Business messages — `src/lib/business.ts`
+
+Lengkap untuk semua jenis native-flow button + product/catalog/MPM/carousel.
+**Render bergantung versi WA penerima** (Business / Beta paling konsisten).
+
+### `sendNativeFlowInfo()` — single button, raw `name` + `params`
+
+Helper paling generic — kasih `name` (jenis button) + `params` (shape-nya
+tergantung `name`-nya). Berguna kalau kamu mau:
+- pakai `single_select` (menu list-style),
+- kirim tipe button apapun yang belum ada wrapper-nya,
+- atau experiment dengan native_flow type baru.
+
+```ts
+import { sendNativeFlowInfo } from './lib/business'
+
+// Single-select menu (replaces sendList):
+await sendNativeFlowInfo(sock, msg.chatJid, {
+  text: 'Pilih kategori:',
+  name: 'single_select',
+  params: {
+    title: 'Lihat menu',
+    sections: [
+      {
+        title: 'Promo',
+        rows: [
+          { id: 'prom_kaos',   title: 'Kaos',   description: 'Diskon 30%' },
+          { id: 'prom_celana', title: 'Celana', description: 'Diskon 20%' },
+        ],
+      },
+    ],
+  },
+  title: 'Toko ABC',
+  footer: 'Powered by Baileys',
+  quoted: msg.raw,
+})
+
+// Quick-reply dengan header image + custom button id:
+await sendNativeFlowInfo(sock, msg.chatJid, {
+  text: 'Konfirmasi pembayaran?',
+  name: 'quick_reply',
+  params: { display_text: 'Bayar Sekarang', id: 'PAY_NOW' },
+  header: { type: 'image', image: { url: 'https://picsum.photos/600/400' } },
+})
+```
+
+Tangkap response-nya:
+```ts
+onMessage(async ({ sock, msg }) => {
+  if (msg.kind !== 'interactiveResponse') return
+  if (msg.responseName === 'single_select' && msg.responseId === 'prom_kaos') { /* ... */ }
+  if (msg.responseName === 'quick_reply'   && msg.responseId === 'PAY_NOW')   { /* ... */ }
+})
+```
+
+### `sendNativeFlow()` — multi-button, fleksibel
+
+```ts
+import { sendNativeFlow } from './lib/business'
+
+await sendNativeFlow(sock, msg.chatJid, {
+  text: 'Pilih opsi:',
+  title: 'Toko ABC',
+  footer: 'Powered by Baileys',
+  buttons: [
+    { name: 'quick_reply', params: { display_text: 'Order', id: 'ORDER' } },
+    { name: 'cta_url',     params: { display_text: 'Web',   url: 'https://example.com' } },
+    { name: 'cta_call',    params: { display_text: 'CS',    phone_number: '6281234567890' } },
+    { name: 'cta_copy',    params: { display_text: 'Promo', copy_code: 'DISC10' } },
+  ],
+  // Header optional — image / video / document
+  header: { type: 'image', image: { url: 'https://picsum.photos/600/400' } },
+  quoted: msg.raw,
+})
+```
+
+Semua nama native flow yang didukung: `quick_reply`, `cta_url`, `cta_call`,
+`cta_copy`, `cta_reminder`, `cta_cancel_reminder`, `address_message`,
+`send_location`, `single_select`, `mpm`, `cta_catalog`, `payment_info`,
+`review_and_pay`, `review_order`, `payment_method`, `payment_status`,
+`automated_greeting_message_view_catalog`, `wa_payment_transaction_details`.
+Boleh pakai nama custom (string apa saja) untuk forward-compat.
+
+### `sendMultiProduct()` — MPM (catalog selector)
+
+```ts
+import { sendMultiProduct } from './lib/business'
+
+await sendMultiProduct(sock, msg.chatJid, {
+  businessOwnerJid: '6281234567890@s.whatsapp.net',  // owner katalog
+  text: 'Lihat produk kami:',
+  title: 'Katalog Toko',
+  footer: 'Tap untuk detail',
+  sections: [
+    { title: 'New Arrivals', productIds: ['1234567890', '1234567891'] },
+    { title: 'Best Sellers', productIds: ['1234567892'] },
+  ],
+})
+```
+
+Product id-nya ambil dari catalog WhatsApp Business (Settings → Business
+tools → Catalog).
+
+### `sendCatalogButton()` — buka catalog langsung
+
+```ts
+import { sendCatalogButton } from './lib/business'
+
+await sendCatalogButton(sock, msg.chatJid, {
+  text: 'Lihat semua produk kami:',
+  businessOwnerJid: '6281234567890@s.whatsapp.net',
+  catalogText: 'Buka Katalog',
+})
+```
+
+### `sendProduct()` — single product card
+
+```ts
+import { sendProduct } from './lib/business'
+
+await sendProduct(sock, msg.chatJid, {
+  productId: '1234567890',
+  businessOwnerJid: '6281234567890@s.whatsapp.net',
+  title: 'Kaos Polos Hitam',
+  description: 'Cotton combed 30s',
+  currencyCode: 'IDR',
+  priceAmount1000: 75_000_000,         // 75.000 IDR (× 1000)
+  salePriceAmount1000: 50_000_000,     // 50.000 IDR
+  retailerId: 'KAOS-HITAM-M',
+  productImage: { url: 'https://example.com/kaos.jpg' },
+  bodyText: 'Promo bulan ini!',
+  footerText: 'Stok terbatas',
+})
+```
+
+### `sendCarousel()` — multiple cards
+
+```ts
+import { sendCarousel } from './lib/business'
+
+await sendCarousel(sock, msg.chatJid, {
+  text: 'Promo minggu ini:',
+  cards: [
+    {
+      title: 'Kaos',
+      text: 'Diskon 30%',
+      header: { type: 'image', image: { url: 'https://example.com/kaos.jpg' } },
+      buttons: [
+        { name: 'quick_reply', params: { display_text: 'Beli', id: 'buy_kaos' } },
+        { name: 'cta_url',     params: { display_text: 'Detail', url: 'https://example.com/kaos' } },
+      ],
+    },
+    {
+      title: 'Celana',
+      text: 'Diskon 20%',
+      header: { type: 'image', image: { url: 'https://example.com/celana.jpg' } },
+      buttons: [
+        { name: 'quick_reply', params: { display_text: 'Beli', id: 'buy_celana' } },
+      ],
+    },
+  ],
+})
+```
+
+### Address & Location request
+
+```ts
+import { requestAddress, requestLocation } from './lib/business'
+
+await requestAddress(sock, msg.chatJid, { text: 'Alamat pengiriman?' })
+await requestLocation(sock, msg.chatJid, { text: 'Lokasi pickup-mu?' })
+```
 
 ### Group events — `onGroupUpdate()`
 
@@ -275,21 +596,43 @@ npm start
 
 ## Stability strategy
 
-| Reason                        | Behaviour                                    |
-| ----------------------------- | -------------------------------------------- |
-| `restartRequired`             | Reconnect 1 s.                               |
-| `connectionClosed/Lost`       | Reconnect 2 s.                               |
-| `timedOut`                    | Reconnect 5 s.                               |
-| `connectionReplaced`          | Reconnect 30 s (jangan loop dengan device lain). |
-| `badSession` / `multideviceMismatch` | Reconnect 3 s.                        |
-| `loggedOut` (401)             | Wipe session + exit. Manual re-pair.         |
-| Anything else                 | Reconnect 5 s.                               |
+### DisconnectReason routing
 
-`onSocket()` binders dijalankan ulang setiap kali fresh socket dibuat, jadi
-handler `onMessage()` & `onGroupUpdate()` terus aktif tanpa intervensi.
+| Reason                  | Behaviour                                                  |
+| ----------------------- | ---------------------------------------------------------- |
+| `restartRequired`       | Reconnect 1 s.                                             |
+| `connectionClosed/Lost` | Reconnect 2 s.                                             |
+| `timedOut`              | Reconnect 5 s.                                             |
+| `badSession`            | Reconnect 3 s — signal store rebuilds itself on next conn. |
+| `connectionReplaced`    | **Exit** — device lain ngambil session, jangan loop.       |
+| `forbidden` (403)       | **Exit** — akun di-banned/flag, retry hanya bikin worse.   |
+| `multideviceMismatch`   | **Wipe session + exit** — re-pair manual.                  |
+| `loggedOut` (401)       | **Wipe session + exit** — re-pair manual.                  |
+| Anything else           | Reconnect 5 s.                                             |
 
-`process.on('unhandledRejection')` & `uncaughtException` di-catch — bot tidak
-crash karena error sporadis dari payload aneh.
+### Anti–"waiting for this message" / decryption-retry
+
+In-memory message store (cap 1000, LRU-style) ditanam di `core/messageStore.ts`.
+Setiap pesan masuk/keluar disimpan keyed by `chat:id`. Baileys'
+`getMessage` callback ngambil dari store ini supaya retry-receipt dari peer
+selalu bisa di-replay → no more bubbles "this message couldn't be displayed"
+di sisi lawan bicara.
+
+### Lain-lain
+
+- `fetchLatestBaileysVersion()` di tiap boot — hindari force-logout karena
+  WA naikin protocol version.
+- `keepAliveIntervalMs: 25_000` — di bawah idle-timeout WA.
+- `markOnlineOnConnect: false` — bot nggak bikin kontak pikir kamu online tiap
+  reconnect.
+- `shouldIgnoreJid: jid => jid?.endsWith('@broadcast')` — skip status broadcast.
+- `cachedGroupMetadata` 10-menit cache — kirim ke grup nggak fetch metadata
+  setiap kali, auto-invalidate kalau ada participant change / group update.
+- `emitOwnEvents: false` — bot nggak loop dari pesannya sendiri.
+- `process.on('unhandledRejection' / 'uncaughtException')` di-swallow —
+  payload aneh dari peer nggak bisa bunuh bot.
+- `onSocket()` binders dijalankan ulang setiap fresh socket → `onMessage()`
+  & `onGroupUpdate()` terus aktif tanpa intervensi pas reconnect.
 
 ## Scripts
 

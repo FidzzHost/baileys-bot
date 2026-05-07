@@ -1,6 +1,7 @@
 import { startSocket, getSocket } from './core/socket'
 import { attachMessageDispatcher, onMessage } from './handlers/messages'
 import { attachGroupDispatcher } from './handlers/groups'
+import { attachStatusTracker } from './lib/status'
 import { logger } from './core/logger'
 import { reply } from './lib/messages'
 
@@ -23,6 +24,7 @@ onMessage(async ({ sock, msg }) => {
 async function main() {
   attachMessageDispatcher()
   attachGroupDispatcher()
+  attachStatusTracker()
   await startSocket()
 }
 
