@@ -92,7 +92,9 @@ src/
 │   └── groups.ts           # onGroupUpdate() registry + dispatcher
 └── lib/
     ├── parser.ts           # extract text/quoted/mentions/jid (unwrap ephemeral, viewOnce, dst)
-    ├── messages.ts         # SEMUA send helpers — basic + rich
+    ├── messages.ts         # send helpers — basic (text/media/list/buttons/CTA/poll/contact/location)
+    ├── business.ts         # business send helpers — native flow, MPM, catalog, single product, carousel, address/location request
+    ├── sticker.ts          # toWebp() + sendStickerFromMedia()
     ├── permissions.ts      # owner & admin checks
     └── db.ts               # better-sqlite3 + kv store + group settings
 ```
@@ -197,13 +199,181 @@ onMessage(async ({ sock, msg }) => {
 ```
 text · image · video · audio · document · sticker
 contact · contactsArray · location · liveLocation
-poll · reaction
+poll · pollUpdate · reaction
 buttonsResponse · listResponse · templateButtonReply · interactiveResponse
+product · order · invoice · paymentRequest · paymentSend · paymentInvite
 protocolEdit · protocolDelete · unknown
 ```
 
 `msg.quoted.kind` punya range yang sama, plus `msg.quoted.asWAMessage` siap
 di-pass ke `downloadMedia()`.
+
+Untuk button / list / interactive responses:
+- `msg.responseId` — id yang dipilih user (semua tipe response)
+- `msg.responseName` — nama native flow button (`quick_reply`, `cta_url`, `mpm`, `single_select`, dst.)
+- `msg.responseParams` — parsed `paramsJson` payload (untuk interactive response)
+
+```ts
+onMessage(async ({ sock, msg }) => {
+  if (msg.kind === 'interactiveResponse') {
+    console.log('User tapped:', msg.responseName, msg.responseId)
+    console.log('Full params:', msg.responseParams)
+  }
+})
+```
+
+## Sticker — `toWebp()` & `sendStickerFromMedia()`
+
+```ts
+import { toWebp, sendStickerFromMedia } from './lib/sticker'
+import { downloadMedia } from './lib/messages'
+
+// Image / video di-quote → sticker
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!s') return
+  if (!msg.quoted || !['image', 'video'].includes(msg.quoted.kind)) {
+    await reply(sock, msg.chatJid, 'Reply gambar/video dulu ya.', msg.raw)
+    return
+  }
+  const buf = await downloadMedia(sock, msg.quoted.asWAMessage)
+  await sendStickerFromMedia(sock, msg.chatJid, buf, {
+    pack: 'My Pack',
+    author: msg.senderJid.split('@')[0],
+    type: 'full',           // 'full' | 'crop' | 'circle' | 'rounded'
+    quality: 60,
+    quoted: msg.raw,
+  })
+})
+
+// Atau langsung dari URL
+const webp = await toWebp('https://example.com/image.png', { type: 'circle' })
+```
+
+Constraints WhatsApp: animated sticker ≤ 10 detik & ≤ 500 KB. Sumber video
+sebaiknya ≤ 6 detik supaya aman.
+
+## Business messages — `src/lib/business.ts`
+
+Lengkap untuk semua jenis native-flow button + product/catalog/MPM/carousel.
+**Render bergantung versi WA penerima** (Business / Beta paling konsisten).
+
+### `sendNativeFlow()` — fleksibel, semua jenis button
+
+```ts
+import { sendNativeFlow } from './lib/business'
+
+await sendNativeFlow(sock, msg.chatJid, {
+  text: 'Pilih opsi:',
+  title: 'Toko ABC',
+  footer: 'Powered by Baileys',
+  buttons: [
+    { name: 'quick_reply', params: { display_text: 'Order', id: 'ORDER' } },
+    { name: 'cta_url',     params: { display_text: 'Web',   url: 'https://example.com' } },
+    { name: 'cta_call',    params: { display_text: 'CS',    phone_number: '6281234567890' } },
+    { name: 'cta_copy',    params: { display_text: 'Promo', copy_code: 'DISC10' } },
+  ],
+  // Header optional — image / video / document
+  header: { type: 'image', image: { url: 'https://picsum.photos/600/400' } },
+  quoted: msg.raw,
+})
+```
+
+Semua nama native flow yang didukung: `quick_reply`, `cta_url`, `cta_call`,
+`cta_copy`, `cta_reminder`, `cta_cancel_reminder`, `address_message`,
+`send_location`, `single_select`, `mpm`, `cta_catalog`, `payment_info`,
+`review_and_pay`, `review_order`, `payment_method`, `payment_status`,
+`automated_greeting_message_view_catalog`, `wa_payment_transaction_details`.
+Boleh pakai nama custom (string apa saja) untuk forward-compat.
+
+### `sendMultiProduct()` — MPM (catalog selector)
+
+```ts
+import { sendMultiProduct } from './lib/business'
+
+await sendMultiProduct(sock, msg.chatJid, {
+  businessOwnerJid: '6281234567890@s.whatsapp.net',  // owner katalog
+  text: 'Lihat produk kami:',
+  title: 'Katalog Toko',
+  footer: 'Tap untuk detail',
+  sections: [
+    { title: 'New Arrivals', productIds: ['1234567890', '1234567891'] },
+    { title: 'Best Sellers', productIds: ['1234567892'] },
+  ],
+})
+```
+
+Product id-nya ambil dari catalog WhatsApp Business (Settings → Business
+tools → Catalog).
+
+### `sendCatalogButton()` — buka catalog langsung
+
+```ts
+import { sendCatalogButton } from './lib/business'
+
+await sendCatalogButton(sock, msg.chatJid, {
+  text: 'Lihat semua produk kami:',
+  businessOwnerJid: '6281234567890@s.whatsapp.net',
+  catalogText: 'Buka Katalog',
+})
+```
+
+### `sendProduct()` — single product card
+
+```ts
+import { sendProduct } from './lib/business'
+
+await sendProduct(sock, msg.chatJid, {
+  productId: '1234567890',
+  businessOwnerJid: '6281234567890@s.whatsapp.net',
+  title: 'Kaos Polos Hitam',
+  description: 'Cotton combed 30s',
+  currencyCode: 'IDR',
+  priceAmount1000: 75_000_000,         // 75.000 IDR (× 1000)
+  salePriceAmount1000: 50_000_000,     // 50.000 IDR
+  retailerId: 'KAOS-HITAM-M',
+  productImage: { url: 'https://example.com/kaos.jpg' },
+  bodyText: 'Promo bulan ini!',
+  footerText: 'Stok terbatas',
+})
+```
+
+### `sendCarousel()` — multiple cards
+
+```ts
+import { sendCarousel } from './lib/business'
+
+await sendCarousel(sock, msg.chatJid, {
+  text: 'Promo minggu ini:',
+  cards: [
+    {
+      title: 'Kaos',
+      text: 'Diskon 30%',
+      header: { type: 'image', image: { url: 'https://example.com/kaos.jpg' } },
+      buttons: [
+        { name: 'quick_reply', params: { display_text: 'Beli', id: 'buy_kaos' } },
+        { name: 'cta_url',     params: { display_text: 'Detail', url: 'https://example.com/kaos' } },
+      ],
+    },
+    {
+      title: 'Celana',
+      text: 'Diskon 20%',
+      header: { type: 'image', image: { url: 'https://example.com/celana.jpg' } },
+      buttons: [
+        { name: 'quick_reply', params: { display_text: 'Beli', id: 'buy_celana' } },
+      ],
+    },
+  ],
+})
+```
+
+### Address & Location request
+
+```ts
+import { requestAddress, requestLocation } from './lib/business'
+
+await requestAddress(sock, msg.chatJid, { text: 'Alamat pengiriman?' })
+await requestLocation(sock, msg.chatJid, { text: 'Lokasi pickup-mu?' })
+```
 
 ### Group events — `onGroupUpdate()`
 

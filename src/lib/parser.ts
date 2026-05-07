@@ -12,11 +12,18 @@ export type MessageKind =
   | 'location'
   | 'liveLocation'
   | 'poll'
+  | 'pollUpdate'
   | 'reaction'
   | 'buttonsResponse'
   | 'listResponse'
   | 'templateButtonReply'
   | 'interactiveResponse'
+  | 'product'
+  | 'order'
+  | 'invoice'
+  | 'paymentRequest'
+  | 'paymentSend'
+  | 'paymentInvite'
   | 'protocolEdit'
   | 'protocolDelete'
   | 'unknown'
@@ -66,6 +73,22 @@ export interface ParsedMessage {
   /** wrapper flags */
   isEphemeral: boolean
   isViewOnce: boolean
+  /**
+   * For button / list / template / interactive responses: the id the user
+   * selected. For interactive (native_flow) responses, this is taken from the
+   * `id` field inside `paramsJson` when present.
+   */
+  responseId: string | undefined
+  /**
+   * For interactive (native_flow) responses: the button `name` the user
+   * tapped (e.g. `quick_reply`, `cta_url`, `mpm`, `single_select`).
+   */
+  responseName: string | undefined
+  /**
+   * For interactive (native_flow) responses: parsed `paramsJson` payload, or
+   * `undefined` if it cannot be parsed.
+   */
+  responseParams: Record<string, unknown> | undefined
 }
 
 export function parse(raw: WAMessage): ParsedMessage | null {
@@ -143,6 +166,8 @@ export function parse(raw: WAMessage): ParsedMessage | null {
     }
   }
 
+  const responseInfo = extractResponse(message, type)
+
   return {
     raw,
     chatJid,
@@ -159,7 +184,56 @@ export function parse(raw: WAMessage): ParsedMessage | null {
     mimeType,
     isEphemeral,
     isViewOnce,
+    responseId: responseInfo.id,
+    responseName: responseInfo.name,
+    responseParams: responseInfo.params,
   }
+}
+
+function extractResponse(
+  message: proto.IMessage,
+  type: keyof proto.IMessage | undefined,
+): {
+  id: string | undefined
+  name: string | undefined
+  params: Record<string, unknown> | undefined
+} {
+  if (type === 'buttonsResponseMessage') {
+    return {
+      id: message.buttonsResponseMessage?.selectedButtonId ?? undefined,
+      name: undefined,
+      params: undefined,
+    }
+  }
+  if (type === 'listResponseMessage') {
+    return {
+      id: message.listResponseMessage?.singleSelectReply?.selectedRowId ?? undefined,
+      name: undefined,
+      params: undefined,
+    }
+  }
+  if (type === 'templateButtonReplyMessage') {
+    return {
+      id: message.templateButtonReplyMessage?.selectedId ?? undefined,
+      name: undefined,
+      params: undefined,
+    }
+  }
+  if (type === 'interactiveResponseMessage') {
+    const flow = message.interactiveResponseMessage?.nativeFlowResponseMessage
+    let params: Record<string, unknown> | undefined
+    let id: string | undefined
+    if (flow?.paramsJson) {
+      try {
+        params = JSON.parse(flow.paramsJson) as Record<string, unknown>
+        if (typeof params.id === 'string') id = params.id
+      } catch {
+        params = undefined
+      }
+    }
+    return { id, name: flow?.name ?? undefined, params }
+  }
+  return { id: undefined, name: undefined, params: undefined }
 }
 
 function extractText(message: proto.IMessage, type: keyof proto.IMessage | undefined): string {
@@ -209,6 +283,24 @@ function extractText(message: proto.IMessage, type: keyof proto.IMessage | undef
       return message.pollCreationMessage?.name ?? ''
     case 'pollCreationMessageV3':
       return (message as proto.IMessage & { pollCreationMessageV3?: { name?: string } }).pollCreationMessageV3?.name ?? ''
+    case 'productMessage':
+      return (
+        message.productMessage?.product?.title ??
+        message.productMessage?.body ??
+        ''
+      )
+    case 'orderMessage':
+      return (
+        message.orderMessage?.message ??
+        message.orderMessage?.orderTitle ??
+        ''
+      )
+    case 'invoiceMessage':
+      return message.invoiceMessage?.note ?? ''
+    case 'requestPaymentMessage':
+      return message.requestPaymentMessage?.noteMessage?.extendedTextMessage?.text ?? ''
+    case 'sendPaymentMessage':
+      return message.sendPaymentMessage?.noteMessage?.extendedTextMessage?.text ?? ''
     default:
       return ''
   }
@@ -227,11 +319,18 @@ function classify(message: proto.IMessage, type: keyof proto.IMessage | undefine
   if (type === 'locationMessage') return 'location'
   if (type === 'liveLocationMessage') return 'liveLocation'
   if (type === 'pollCreationMessage' || type === 'pollCreationMessageV3') return 'poll'
+  if (type === 'pollUpdateMessage') return 'pollUpdate'
   if (type === 'reactionMessage') return 'reaction'
   if (type === 'buttonsResponseMessage') return 'buttonsResponse'
   if (type === 'listResponseMessage') return 'listResponse'
   if (type === 'templateButtonReplyMessage') return 'templateButtonReply'
   if (type === 'interactiveResponseMessage') return 'interactiveResponse'
+  if (type === 'productMessage') return 'product'
+  if (type === 'orderMessage') return 'order'
+  if (type === 'invoiceMessage') return 'invoice'
+  if (type === 'requestPaymentMessage') return 'paymentRequest'
+  if (type === 'sendPaymentMessage') return 'paymentSend'
+  if (type === 'paymentInviteMessage') return 'paymentInvite'
   if (type === 'protocolMessage') {
     const op = message.protocolMessage?.type
     if (op === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) return 'protocolEdit'
@@ -266,6 +365,13 @@ function contextInfoOf(message: proto.IMessage): proto.IContextInfo | undefined 
     message.buttonsMessage?.contextInfo ??
     message.listMessage?.contextInfo ??
     message.templateMessage?.contextInfo ??
+    message.buttonsResponseMessage?.contextInfo ??
+    message.listResponseMessage?.contextInfo ??
+    message.templateButtonReplyMessage?.contextInfo ??
+    message.interactiveMessage?.contextInfo ??
+    message.interactiveResponseMessage?.contextInfo ??
+    message.productMessage?.contextInfo ??
+    message.orderMessage?.contextInfo ??
     undefined
   )
 }
