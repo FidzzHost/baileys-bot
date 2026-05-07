@@ -458,39 +458,59 @@ export function sendReminderButton(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Rich quick-reply buttons (modern v2) + Single-select sugar
+// Native-flow info — raw, generic helper for any native_flow button name
 // ──────────────────────────────────────────────────────────────────────────────
 
-export interface RichButton {
-  /** Stable id you'll receive on `msg.responseId` when user taps the button. */
-  id: string
-  /** Text shown on the button. */
-  label: string
-}
-
 /**
- * Send up to ~3 quick-reply buttons with optional rich header
- * (image / video / document) + body + footer. Modern replacement for the
- * deprecated `buttonsMessage` (button v1) — uses native_flow `quick_reply`
- * under the hood, so it actually renders on WA Business and modern beta
- * builds.
+ * Low-level helper to send a single native_flow button by `name` + `params`,
+ * with optional rich header (image / video / document), body, footer, and
+ * title. This is the most direct way to construct any button type
+ * WhatsApp recognises — past, present, or future — without waiting for a
+ * dedicated typed wrapper.
  *
- * Tap routing in `onMessage()`:
- * ```ts
- * if (msg.kind === 'interactiveResponse' && msg.responseName === 'quick_reply') {
- *   switch (msg.responseId) {
- *     case 'BUY':   ...
- *     case 'INFO':  ...
- *   }
- * }
- * ```
+ * Common names: `quick_reply`, `single_select`, `cta_url`, `cta_call`,
+ * `cta_copy`, `cta_reminder`, `cta_cancel_reminder`, `address_message`,
+ * `send_location`, `mpm`, `cta_catalog`, `payment_info`, `review_and_pay`,
+ * `review_order`, `payment_method`, `payment_status`,
+ * `automated_greeting_message_view_catalog`, `wa_payment_transaction_details`.
+ *
+ * Receive side: tap arrives as `kind === 'interactiveResponse'` with
+ * `responseName` matching `name`. Selected id is on `responseId` (or full
+ * payload at `responseParams`).
+ *
+ * @example single_select (list-style menu)
+ *   await sendNativeFlowInfo(sock, jid, {
+ *     text: 'Pilih kategori:',
+ *     name: 'single_select',
+ *     params: {
+ *       title: 'Lihat menu',
+ *       sections: [{
+ *         title: 'Promo',
+ *         rows: [
+ *           { id: 'prom_kaos', title: 'Kaos', description: 'Diskon 30%' },
+ *         ],
+ *       }],
+ *     },
+ *   })
+ *
+ * @example quick_reply with image header
+ *   await sendNativeFlowInfo(sock, jid, {
+ *     text: 'Konfirmasi order?',
+ *     name: 'quick_reply',
+ *     params: { display_text: 'Bayar', id: 'PAY' },
+ *     header: { type: 'image', image: { url: 'https://...' } },
+ *   })
  */
-export function sendRichButtons(
+export function sendNativeFlowInfo(
   sock: WASocket,
   jid: string,
   args: {
+    /** Body text of the bubble. */
     text: string
-    buttons: RichButton[]
+    /** Native flow button name (`single_select`, `quick_reply`, `cta_url`, ...). */
+    name: string
+    /** Params object — shape depends on `name`. */
+    params: Record<string, unknown>
     title?: string
     subtitle?: string
     footer?: string
@@ -500,6 +520,7 @@ export function sendRichButtons(
       | { type: 'document'; document: Buffer | { url: string }; fileName: string; mimetype: string }
     mentions?: string[]
     quoted?: proto.IWebMessageInfo
+    viewOnce?: boolean
   },
 ) {
   return sendNativeFlow(sock, jid, {
@@ -510,89 +531,7 @@ export function sendRichButtons(
     header: args.header,
     mentions: args.mentions,
     quoted: args.quoted,
-    buttons: args.buttons.map(b => ({
-      name: 'quick_reply',
-      params: { display_text: b.label, id: b.id },
-    })),
-  })
-}
-
-export interface SingleSelectRow {
-  /** Stable id surfaced as `msg.responseId` when this row is tapped. */
-  id: string
-  title: string
-  description?: string
-  /** Optional small header text above the row title. */
-  header?: string
-}
-
-export interface SingleSelectSection {
-  title: string
-  rows: SingleSelectRow[]
-}
-
-/**
- * Send a `single_select` native-flow button — like a `listMessage` but
- * delivered through the modern interactive-message pipeline, so it renders
- * more consistently on WA Business / Beta. Tap is captured as
- * `interactiveResponse` with `responseName === 'single_select'` and
- * `responseId` set to the selected row id.
- *
- * @example
- *   await sendSingleSelect(sock, jid, {
- *     text: 'Pilih kategori produk:',
- *     buttonLabel: 'Lihat menu',
- *     title: 'Toko ABC',
- *     footer: 'Powered by Baileys',
- *     sections: [{
- *       title: 'Promo bulan ini',
- *       rows: [
- *         { id: 'prom_kaos',   title: 'Kaos',   description: 'Diskon 30%' },
- *         { id: 'prom_celana', title: 'Celana', description: 'Diskon 20%' },
- *       ],
- *     }],
- *   })
- */
-export function sendSingleSelect(
-  sock: WASocket,
-  jid: string,
-  args: {
-    text: string
-    buttonLabel: string
-    sections: SingleSelectSection[]
-    title?: string
-    subtitle?: string
-    footer?: string
-    header?:
-      | { type: 'image'; image: Buffer | { url: string } }
-      | { type: 'video'; video: Buffer | { url: string } }
-      | { type: 'document'; document: Buffer | { url: string }; fileName: string; mimetype: string }
-    quoted?: proto.IWebMessageInfo
-  },
-) {
-  return sendNativeFlow(sock, jid, {
-    text: args.text,
-    title: args.title,
-    subtitle: args.subtitle,
-    footer: args.footer,
-    header: args.header,
-    quoted: args.quoted,
-    buttons: [
-      {
-        name: 'single_select',
-        params: {
-          title: args.buttonLabel,
-          sections: args.sections.map(s => ({
-            title: s.title,
-            rows: s.rows.map(r => ({
-              header: r.header,
-              title: r.title,
-              description: r.description,
-              id: r.id,
-            })),
-          })),
-        },
-      },
-    ],
+    viewOnce: args.viewOnce,
+    buttons: [{ name: args.name, params: args.params }],
   })
 }

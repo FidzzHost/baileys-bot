@@ -11,8 +11,12 @@ poll, location, contact, dst). Logic bisnis kamu tulis sendiri lewat hook
 
 - **Multi-runtime**: Linux/VPS, Termux Android, Windows.
 - **Auth flexible**: pairing-code (8-digit) **atau** QR — toggle via env.
-- **Stability**: auto-reconnect dengan backoff per-`DisconnectReason`, anti
-  bad-session, anti loop, keep-alive 30 s, swallow unhandled rejections.
+- **Stability**: auto-reconnect dengan backoff per-`DisconnectReason`,
+  in-memory message store untuk peer retry-receipts (anti "waiting for this
+  message"), `fetchLatestBaileysVersion()` tiap boot, group metadata cache
+  10 menit, keep-alive 25 s, terminal exit untuk `loggedOut` /
+  `connectionReplaced` / `forbidden` (anti loop), swallow unhandled
+  rejections.
 - **Comprehensive parser**: unwrap ephemeral / view-once / document-with-caption
   wrappers, extract text/quoted/mentions dari semua tipe pesan termasuk
   `buttonsResponse`, `listResponse`, `interactiveResponse`, `templateButtonReply`.
@@ -85,7 +89,8 @@ src/
 ├── config/env.ts           # loader .env + validasi
 ├── core/
 │   ├── auth.ts             # multi-file auth, normalisasi nomor, clear session
-│   ├── socket.ts           # makeWASocket + reconnect/backoff + onSocket binders
+│   ├── socket.ts           # makeWASocket + reconnect/backoff + onSocket binders + getMessage cb
+│   ├── messageStore.ts     # in-memory store untuk getMessage + cachedGroupMetadata
 │   └── logger.ts           # pino + pino-pretty
 ├── handlers/
 │   ├── messages.ts         # onMessage() registry + dispatcher (auto-rebind on reconnect)
@@ -257,82 +262,57 @@ sebaiknya ≤ 6 detik supaya aman.
 Lengkap untuk semua jenis native-flow button + product/catalog/MPM/carousel.
 **Render bergantung versi WA penerima** (Business / Beta paling konsisten).
 
-### `sendRichButtons()` — quick-reply buttons + header media
+### `sendNativeFlowInfo()` — single button, raw `name` + `params`
 
-Modern pengganti `buttonsMessage` v1 (deprecated). Render di WA Business / Beta;
-client lawas fallback ke text.
-
-```ts
-import { sendRichButtons } from './lib/business'
-
-await sendRichButtons(sock, msg.chatJid, {
-  text: 'Mau order produk apa?',
-  title: 'Toko ABC',
-  footer: 'Powered by Baileys',
-  header: { type: 'image', image: { url: 'https://picsum.photos/600/400' } },
-  buttons: [
-    { id: 'BUY_KAOS',    label: 'Kaos' },
-    { id: 'BUY_CELANA',  label: 'Celana' },
-    { id: 'INFO',        label: 'Info toko' },
-  ],
-  quoted: msg.raw,
-})
-```
-
-Tap routing:
-```ts
-onMessage(async ({ sock, msg }) => {
-  if (msg.kind !== 'interactiveResponse' || msg.responseName !== 'quick_reply') return
-  switch (msg.responseId) {
-    case 'BUY_KAOS':   /* handle */ break
-    case 'BUY_CELANA': /* handle */ break
-    case 'INFO':       /* handle */ break
-  }
-})
-```
-
-### `sendSingleSelect()` — native flow list/menu
-
-Mirip `sendList()` tapi via interactive-message (lebih konsisten render-nya
-di WA Business). Tap dibungkus sebagai `interactiveResponse` dengan
-`responseName === 'single_select'` dan `responseId` = id row yang dipilih.
+Helper paling generic — kasih `name` (jenis button) + `params` (shape-nya
+tergantung `name`-nya). Berguna kalau kamu mau:
+- pakai `single_select` (menu list-style),
+- kirim tipe button apapun yang belum ada wrapper-nya,
+- atau experiment dengan native_flow type baru.
 
 ```ts
-import { sendSingleSelect } from './lib/business'
+import { sendNativeFlowInfo } from './lib/business'
 
-await sendSingleSelect(sock, msg.chatJid, {
+// Single-select menu (replaces sendList):
+await sendNativeFlowInfo(sock, msg.chatJid, {
   text: 'Pilih kategori:',
-  buttonLabel: 'Lihat menu',
+  name: 'single_select',
+  params: {
+    title: 'Lihat menu',
+    sections: [
+      {
+        title: 'Promo',
+        rows: [
+          { id: 'prom_kaos',   title: 'Kaos',   description: 'Diskon 30%' },
+          { id: 'prom_celana', title: 'Celana', description: 'Diskon 20%' },
+        ],
+      },
+    ],
+  },
   title: 'Toko ABC',
   footer: 'Powered by Baileys',
-  sections: [
-    {
-      title: 'Promo',
-      rows: [
-        { id: 'prom_kaos',   title: 'Kaos',   description: 'Diskon 30%' },
-        { id: 'prom_celana', title: 'Celana', description: 'Diskon 20%' },
-      ],
-    },
-    {
-      title: 'Reguler',
-      rows: [
-        { id: 'reg_topi', title: 'Topi', description: 'Stok lengkap' },
-      ],
-    },
-  ],
   quoted: msg.raw,
 })
-```
 
-Tap routing:
-```ts
-onMessage(async ({ sock, msg }) => {
-  if (msg.responseName !== 'single_select') return
-  if (msg.responseId === 'prom_kaos') { /* handle */ }
+// Quick-reply dengan header image + custom button id:
+await sendNativeFlowInfo(sock, msg.chatJid, {
+  text: 'Konfirmasi pembayaran?',
+  name: 'quick_reply',
+  params: { display_text: 'Bayar Sekarang', id: 'PAY_NOW' },
+  header: { type: 'image', image: { url: 'https://picsum.photos/600/400' } },
 })
 ```
 
-### `sendNativeFlow()` — fleksibel, semua jenis button
+Tangkap response-nya:
+```ts
+onMessage(async ({ sock, msg }) => {
+  if (msg.kind !== 'interactiveResponse') return
+  if (msg.responseName === 'single_select' && msg.responseId === 'prom_kaos') { /* ... */ }
+  if (msg.responseName === 'quick_reply'   && msg.responseId === 'PAY_NOW')   { /* ... */ }
+})
+```
+
+### `sendNativeFlow()` — multi-button, fleksibel
 
 ```ts
 import { sendNativeFlow } from './lib/business'
@@ -520,21 +500,43 @@ npm start
 
 ## Stability strategy
 
-| Reason                        | Behaviour                                    |
-| ----------------------------- | -------------------------------------------- |
-| `restartRequired`             | Reconnect 1 s.                               |
-| `connectionClosed/Lost`       | Reconnect 2 s.                               |
-| `timedOut`                    | Reconnect 5 s.                               |
-| `connectionReplaced`          | Reconnect 30 s (jangan loop dengan device lain). |
-| `badSession` / `multideviceMismatch` | Reconnect 3 s.                        |
-| `loggedOut` (401)             | Wipe session + exit. Manual re-pair.         |
-| Anything else                 | Reconnect 5 s.                               |
+### DisconnectReason routing
 
-`onSocket()` binders dijalankan ulang setiap kali fresh socket dibuat, jadi
-handler `onMessage()` & `onGroupUpdate()` terus aktif tanpa intervensi.
+| Reason                  | Behaviour                                                  |
+| ----------------------- | ---------------------------------------------------------- |
+| `restartRequired`       | Reconnect 1 s.                                             |
+| `connectionClosed/Lost` | Reconnect 2 s.                                             |
+| `timedOut`              | Reconnect 5 s.                                             |
+| `badSession`            | Reconnect 3 s — signal store rebuilds itself on next conn. |
+| `connectionReplaced`    | **Exit** — device lain ngambil session, jangan loop.       |
+| `forbidden` (403)       | **Exit** — akun di-banned/flag, retry hanya bikin worse.   |
+| `multideviceMismatch`   | **Wipe session + exit** — re-pair manual.                  |
+| `loggedOut` (401)       | **Wipe session + exit** — re-pair manual.                  |
+| Anything else           | Reconnect 5 s.                                             |
 
-`process.on('unhandledRejection')` & `uncaughtException` di-catch — bot tidak
-crash karena error sporadis dari payload aneh.
+### Anti–"waiting for this message" / decryption-retry
+
+In-memory message store (cap 1000, LRU-style) ditanam di `core/messageStore.ts`.
+Setiap pesan masuk/keluar disimpan keyed by `chat:id`. Baileys'
+`getMessage` callback ngambil dari store ini supaya retry-receipt dari peer
+selalu bisa di-replay → no more bubbles "this message couldn't be displayed"
+di sisi lawan bicara.
+
+### Lain-lain
+
+- `fetchLatestBaileysVersion()` di tiap boot — hindari force-logout karena
+  WA naikin protocol version.
+- `keepAliveIntervalMs: 25_000` — di bawah idle-timeout WA.
+- `markOnlineOnConnect: false` — bot nggak bikin kontak pikir kamu online tiap
+  reconnect.
+- `shouldIgnoreJid: jid => jid?.endsWith('@broadcast')` — skip status broadcast.
+- `cachedGroupMetadata` 10-menit cache — kirim ke grup nggak fetch metadata
+  setiap kali, auto-invalidate kalau ada participant change / group update.
+- `emitOwnEvents: false` — bot nggak loop dari pesannya sendiri.
+- `process.on('unhandledRejection' / 'uncaughtException')` di-swallow —
+  payload aneh dari peer nggak bisa bunuh bot.
+- `onSocket()` binders dijalankan ulang setiap fresh socket → `onMessage()`
+  & `onGroupUpdate()` terus aktif tanpa intervensi pas reconnect.
 
 ## Scripts
 

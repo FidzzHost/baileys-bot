@@ -4,6 +4,7 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  proto,
   WASocket,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
@@ -11,6 +12,12 @@ import qrcode from 'qrcode-terminal'
 import { env } from '../config/env'
 import { logger } from './logger'
 import { loadAuth, normalizePhone } from './auth'
+import {
+  cachedGroupMetadata,
+  clearGroupCache,
+  recallMessage,
+  rememberMessage,
+} from './messageStore'
 
 let liveSock: WASocket | null = null
 
@@ -48,7 +55,8 @@ async function startInternal(): Promise<WASocket> {
   const { version, isLatest } = await fetchLatestBaileysVersion()
   logger.info({ version: version.join('.'), isLatest }, 'using whatsapp web version')
 
-  const sock = makeWASocket({
+  let sock!: WASocket
+  sock = makeWASocket({
     version,
     logger: logger.child({ module: 'baileys' }) as never,
     printQRInTerminal: false, // we render manually
@@ -64,11 +72,33 @@ async function startInternal(): Promise<WASocket> {
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: true,
     defaultQueryTimeoutMs: 60_000,
-    keepAliveIntervalMs: 30_000,
+    keepAliveIntervalMs: 25_000,
     emitOwnEvents: false,
+    /** Skip status broadcast — saves CPU and avoids junk in handlers. */
+    shouldIgnoreJid: jid => jid?.endsWith('@broadcast') ?? false,
+    /**
+     * Answer retry-receipts from peers by replaying the original IMessage,
+     * preventing “waiting for this message” states and lost messages on
+     * the recipient side.
+     */
+    getMessage: async key => recallMessage(key.remoteJid ?? '', key.id ?? ''),
+    /** 10-minute in-memory cache so group sends don't fetch metadata each call. */
+    cachedGroupMetadata: jid => cachedGroupMetadata(sock, jid),
   })
 
   sock.ev.on('creds.update', auth.saveCreds)
+
+  // Remember every message we see (incoming + outgoing) so peers' retry
+  // receipts can be answered. Keep memory bounded inside messageStore.
+  sock.ev.on('messages.upsert', upsert => {
+    for (const m of upsert.messages) {
+      rememberMessage(m.key.remoteJid, m.key.id, m.message)
+    }
+  })
+
+  // Drop group metadata cache on participant changes — cheap correctness fix.
+  sock.ev.on('group-participants.update', () => clearGroupCache())
+  sock.ev.on('groups.update', () => clearGroupCache())
 
   // Re-apply all registered binders to this fresh socket.
   for (const b of binders) {
@@ -124,14 +154,32 @@ async function startInternal(): Promise<WASocket> {
     }
 
     if (connection === 'close') {
+      clearGroupCache()
       const code =
         (lastDisconnect?.error as Boom | undefined)?.output?.statusCode ??
         DisconnectReason.connectionClosed
       const reasonName = Object.entries(DisconnectReason).find(([, v]) => v === code)?.[0]
       logger.warn({ code, reason: reasonName }, 'connection closed')
 
+      // Terminal cases — exit instead of looping forever.
       if (code === DisconnectReason.loggedOut) {
         logger.error('logged out by WhatsApp — clearing session and exiting. Re-run to pair again.')
+        await auth.clear()
+        process.exit(0)
+        return
+      }
+      if (code === DisconnectReason.connectionReplaced) {
+        logger.error('another device opened this session — exiting to avoid reconnect war.')
+        process.exit(0)
+        return
+      }
+      if (code === DisconnectReason.forbidden) {
+        logger.error('account forbidden by WhatsApp (likely banned) — exiting.')
+        process.exit(0)
+        return
+      }
+      if (code === DisconnectReason.multideviceMismatch) {
+        logger.error('multi-device mismatch — clearing session and exiting. Re-pair.')
         await auth.clear()
         process.exit(0)
         return
@@ -162,15 +210,15 @@ function backoffFor(code: number): number {
     case DisconnectReason.connectionClosed:
     case DisconnectReason.connectionLost:
       return 2_000
-    case DisconnectReason.connectionReplaced:
-      // Another linked-device session took over — wait longer to avoid loops.
-      return 30_000
     case DisconnectReason.timedOut:
       return 5_000
     case DisconnectReason.badSession:
-    case DisconnectReason.multideviceMismatch:
+      // Session corruption — short delay then reconnect; signal-store rebuilds.
       return 3_000
     default:
       return 5_000
   }
 }
+
+// Re-export proto so handlers don't have to pull baileys directly for typing.
+export { proto }
