@@ -456,3 +456,143 @@ export function sendReminderButton(
     quoted: args.quoted,
   })
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Rich quick-reply buttons (modern v2) + Single-select sugar
+// ──────────────────────────────────────────────────────────────────────────────
+
+export interface RichButton {
+  /** Stable id you'll receive on `msg.responseId` when user taps the button. */
+  id: string
+  /** Text shown on the button. */
+  label: string
+}
+
+/**
+ * Send up to ~3 quick-reply buttons with optional rich header
+ * (image / video / document) + body + footer. Modern replacement for the
+ * deprecated `buttonsMessage` (button v1) — uses native_flow `quick_reply`
+ * under the hood, so it actually renders on WA Business and modern beta
+ * builds.
+ *
+ * Tap routing in `onMessage()`:
+ * ```ts
+ * if (msg.kind === 'interactiveResponse' && msg.responseName === 'quick_reply') {
+ *   switch (msg.responseId) {
+ *     case 'BUY':   ...
+ *     case 'INFO':  ...
+ *   }
+ * }
+ * ```
+ */
+export function sendRichButtons(
+  sock: WASocket,
+  jid: string,
+  args: {
+    text: string
+    buttons: RichButton[]
+    title?: string
+    subtitle?: string
+    footer?: string
+    header?:
+      | { type: 'image'; image: Buffer | { url: string } }
+      | { type: 'video'; video: Buffer | { url: string } }
+      | { type: 'document'; document: Buffer | { url: string }; fileName: string; mimetype: string }
+    mentions?: string[]
+    quoted?: proto.IWebMessageInfo
+  },
+) {
+  return sendNativeFlow(sock, jid, {
+    text: args.text,
+    title: args.title,
+    subtitle: args.subtitle,
+    footer: args.footer,
+    header: args.header,
+    mentions: args.mentions,
+    quoted: args.quoted,
+    buttons: args.buttons.map(b => ({
+      name: 'quick_reply',
+      params: { display_text: b.label, id: b.id },
+    })),
+  })
+}
+
+export interface SingleSelectRow {
+  /** Stable id surfaced as `msg.responseId` when this row is tapped. */
+  id: string
+  title: string
+  description?: string
+  /** Optional small header text above the row title. */
+  header?: string
+}
+
+export interface SingleSelectSection {
+  title: string
+  rows: SingleSelectRow[]
+}
+
+/**
+ * Send a `single_select` native-flow button — like a `listMessage` but
+ * delivered through the modern interactive-message pipeline, so it renders
+ * more consistently on WA Business / Beta. Tap is captured as
+ * `interactiveResponse` with `responseName === 'single_select'` and
+ * `responseId` set to the selected row id.
+ *
+ * @example
+ *   await sendSingleSelect(sock, jid, {
+ *     text: 'Pilih kategori produk:',
+ *     buttonLabel: 'Lihat menu',
+ *     title: 'Toko ABC',
+ *     footer: 'Powered by Baileys',
+ *     sections: [{
+ *       title: 'Promo bulan ini',
+ *       rows: [
+ *         { id: 'prom_kaos',   title: 'Kaos',   description: 'Diskon 30%' },
+ *         { id: 'prom_celana', title: 'Celana', description: 'Diskon 20%' },
+ *       ],
+ *     }],
+ *   })
+ */
+export function sendSingleSelect(
+  sock: WASocket,
+  jid: string,
+  args: {
+    text: string
+    buttonLabel: string
+    sections: SingleSelectSection[]
+    title?: string
+    subtitle?: string
+    footer?: string
+    header?:
+      | { type: 'image'; image: Buffer | { url: string } }
+      | { type: 'video'; video: Buffer | { url: string } }
+      | { type: 'document'; document: Buffer | { url: string }; fileName: string; mimetype: string }
+    quoted?: proto.IWebMessageInfo
+  },
+) {
+  return sendNativeFlow(sock, jid, {
+    text: args.text,
+    title: args.title,
+    subtitle: args.subtitle,
+    footer: args.footer,
+    header: args.header,
+    quoted: args.quoted,
+    buttons: [
+      {
+        name: 'single_select',
+        params: {
+          title: args.buttonLabel,
+          sections: args.sections.map(s => ({
+            title: s.title,
+            rows: s.rows.map(r => ({
+              header: r.header,
+              title: r.title,
+              description: r.description,
+              id: r.id,
+            })),
+          })),
+        },
+      },
+    ],
+  })
+}

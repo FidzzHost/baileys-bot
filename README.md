@@ -257,6 +257,81 @@ sebaiknya ≤ 6 detik supaya aman.
 Lengkap untuk semua jenis native-flow button + product/catalog/MPM/carousel.
 **Render bergantung versi WA penerima** (Business / Beta paling konsisten).
 
+### `sendRichButtons()` — quick-reply buttons + header media
+
+Modern pengganti `buttonsMessage` v1 (deprecated). Render di WA Business / Beta;
+client lawas fallback ke text.
+
+```ts
+import { sendRichButtons } from './lib/business'
+
+await sendRichButtons(sock, msg.chatJid, {
+  text: 'Mau order produk apa?',
+  title: 'Toko ABC',
+  footer: 'Powered by Baileys',
+  header: { type: 'image', image: { url: 'https://picsum.photos/600/400' } },
+  buttons: [
+    { id: 'BUY_KAOS',    label: 'Kaos' },
+    { id: 'BUY_CELANA',  label: 'Celana' },
+    { id: 'INFO',        label: 'Info toko' },
+  ],
+  quoted: msg.raw,
+})
+```
+
+Tap routing:
+```ts
+onMessage(async ({ sock, msg }) => {
+  if (msg.kind !== 'interactiveResponse' || msg.responseName !== 'quick_reply') return
+  switch (msg.responseId) {
+    case 'BUY_KAOS':   /* handle */ break
+    case 'BUY_CELANA': /* handle */ break
+    case 'INFO':       /* handle */ break
+  }
+})
+```
+
+### `sendSingleSelect()` — native flow list/menu
+
+Mirip `sendList()` tapi via interactive-message (lebih konsisten render-nya
+di WA Business). Tap dibungkus sebagai `interactiveResponse` dengan
+`responseName === 'single_select'` dan `responseId` = id row yang dipilih.
+
+```ts
+import { sendSingleSelect } from './lib/business'
+
+await sendSingleSelect(sock, msg.chatJid, {
+  text: 'Pilih kategori:',
+  buttonLabel: 'Lihat menu',
+  title: 'Toko ABC',
+  footer: 'Powered by Baileys',
+  sections: [
+    {
+      title: 'Promo',
+      rows: [
+        { id: 'prom_kaos',   title: 'Kaos',   description: 'Diskon 30%' },
+        { id: 'prom_celana', title: 'Celana', description: 'Diskon 20%' },
+      ],
+    },
+    {
+      title: 'Reguler',
+      rows: [
+        { id: 'reg_topi', title: 'Topi', description: 'Stok lengkap' },
+      ],
+    },
+  ],
+  quoted: msg.raw,
+})
+```
+
+Tap routing:
+```ts
+onMessage(async ({ sock, msg }) => {
+  if (msg.responseName !== 'single_select') return
+  if (msg.responseId === 'prom_kaos') { /* handle */ }
+})
+```
+
 ### `sendNativeFlow()` — fleksibel, semua jenis button
 
 ```ts
