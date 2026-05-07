@@ -74,8 +74,15 @@ async function startInternal(): Promise<WASocket> {
     defaultQueryTimeoutMs: 60_000,
     keepAliveIntervalMs: 25_000,
     emitOwnEvents: false,
-    /** Skip status broadcast — saves CPU and avoids junk in handlers. */
-    shouldIgnoreJid: jid => jid?.endsWith('@broadcast') ?? false,
+    /**
+     * Skip generic broadcast lists, but keep `status@broadcast` so the
+     * status-tracker (`src/lib/status.ts`) can observe stories.
+     */
+    shouldIgnoreJid: jid => {
+      if (!jid) return false
+      if (jid === 'status@broadcast') return false
+      return jid.endsWith('@broadcast')
+    },
     /**
      * Answer retry-receipts from peers by replaying the original IMessage,
      * preventing “waiting for this message” states and lost messages on

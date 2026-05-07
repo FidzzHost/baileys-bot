@@ -100,6 +100,7 @@ src/
     ├── messages.ts         # send helpers — basic (text/media/list/buttons/CTA/poll/contact/location)
     ├── business.ts         # business send helpers — native flow, MPM, catalog, single product, carousel, address/location request
     ├── sticker.ts          # toWebp() + sendStickerFromMedia()
+    ├── status.ts           # status / story tracking — list, mark-read, download
     ├── permissions.ts      # owner & admin checks
     └── db.ts               # better-sqlite3 + kv store + group settings
 ```
@@ -256,6 +257,101 @@ const webp = await toWebp('https://example.com/image.png', { type: 'circle' })
 
 Constraints WhatsApp: animated sticker ≤ 10 detik & ≤ 500 KB. Sumber video
 sebaiknya ≤ 6 detik supaya aman.
+
+## Status / Story (`status@broadcast`) — `src/lib/status.ts`
+
+Auto-tracker untuk story / status update kontak. `attachStatusTracker()`
+sudah dipanggil di `index.ts`. Bot menyimpan setiap status yang masuk ke
+in-memory store (cap 500, FIFO evict). Pas nomor bot di-HP nge-view sebuah
+status, multi-device sync notify ke bot → entry-nya ditandai sebagai
+read (`readAt` di-set).
+
+```ts
+import {
+  onStatusReceived,
+  onStatusRead,
+  getStatuses,
+  getReadStatuses,
+  getUnreadStatuses,
+  markStatusRead,
+  readAllStatuses,
+  downloadStatusMedia,
+} from './lib/status'
+import * as fs from 'fs'
+
+// (1) Hook: log setiap status yang masuk
+onStatusReceived(entry => {
+  console.log(`[status] ${entry.from} - ${entry.kind} - "${entry.text}"`)
+})
+
+// (2) Hook: auto-download media setiap kali bot baca status
+onStatusRead(async entry => {
+  if (!['image', 'video'].includes(entry.kind)) return
+  const sock = getSocket()
+  if (!sock) return
+  const buf = await downloadStatusMedia(sock, entry)
+  const ext = entry.mimeType?.split('/')[1] ?? 'bin'
+  fs.mkdirSync('./status-dump', { recursive: true })
+  fs.writeFileSync(`./status-dump/${entry.id}.${ext}`, buf)
+  console.log(`saved ${entry.id}.${ext} (${buf.length} bytes)`)
+})
+
+// (3) Command: kasih daftar status yang udah di-read
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!status:list') return
+  const list = getReadStatuses()
+  const lines = list.map(
+    e =>
+      `• ${e.from.split('@')[0]} — ${e.kind}` +
+      (e.text ? ` — ${e.text.slice(0, 30)}` : ''),
+  )
+  await reply(
+    sock,
+    msg.chatJid,
+    `Read statuses (${list.length}):\n${lines.join('\n') || '(kosong)'}`,
+    msg.raw,
+  )
+})
+
+// (4) Command: download semua status read sekaligus
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!status:save') return
+  const list = getReadStatuses().filter(e => ['image', 'video'].includes(e.kind))
+  for (const entry of list) {
+    const buf = await downloadStatusMedia(sock, entry)
+    const ext = entry.mimeType?.split('/')[1] ?? 'bin'
+    fs.mkdirSync('./status-dump', { recursive: true })
+    fs.writeFileSync(`./status-dump/${entry.id}.${ext}`, buf)
+  }
+  await reply(sock, msg.chatJid, `✅ Saved ${list.length} files`, msg.raw)
+})
+
+// (5) Mark semua unread sebagai read sekaligus + auto download
+onMessage(async ({ sock, msg }) => {
+  if (msg.text !== '!status:readall') return
+  const just = await readAllStatuses(sock)
+  await reply(sock, msg.chatJid, `Marked ${just.length} as read`, msg.raw)
+})
+```
+
+API ringkas:
+
+| Function | Returns | Purpose |
+| --- | --- | --- |
+| `onStatusReceived(handler)` | disposer | hook setiap status baru masuk |
+| `onStatusRead(handler)` | disposer | hook setiap status di-read (sync atau manual) |
+| `getStatuses()` | `StatusEntry[]` | semua status di memori |
+| `getReadStatuses()` | `StatusEntry[]` | filter `readAt` ter-set |
+| `getUnreadStatuses()` | `StatusEntry[]` | belum di-read |
+| `markStatusRead(sock, target)` | `Promise<entry>` | kirim read receipt + flag readAt |
+| `readAllStatuses(sock)` | `Promise<entry[]>` | bulk-read semua unread |
+| `downloadStatusMedia(sock, entry)` | `Promise<Buffer>` | download bytes media-nya |
+
+Field `StatusEntry`: `id`, `from`, `kind`, `text`, `mimeType`, `receivedAt`,
+`readAt`, `raw`.
+
+Catatan: Memori in-memory aja. Setelah bot restart, list-nya kosong lagi.
+Kalau butuh persistensi, simpan `readAt`/`id`-nya ke SQLite via `lib/db.ts`.
 
 ## Business messages — `src/lib/business.ts`
 
